@@ -1,8 +1,7 @@
 import { runStart } from "./Yuu API/RegisterStart";
 
 
-console.log('Running Start From Project_Name_Here');
+console.log('Running Start From Grabbables');
 
-runStart(); 
+runStart();
 //
-

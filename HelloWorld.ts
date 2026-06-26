@@ -7,7 +7,9 @@ import { registerStart } from "./Yuu API/RegisterStart";
 import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
 
-registerStart(start);
+// Disabled so only Grabbables.ts runs (avoids a duplicate cube + floor).
+// Re-enable this line to bring back the original sample scene.
+// registerStart(start);
 function start() {
   inWorldConsole.visible(true, new Vector3(0, 2, -2));
 
