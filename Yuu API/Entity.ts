@@ -204,6 +204,7 @@ export class Entity {
 
   changeType(type: BaseNodeTypes) {
     if (this.nodeID) {
+      this.type = type;
       this.nodeID = Godot.node.changeType(this.nodeID, type) ?? this.nodeID;
     }
   }
