@@ -55,7 +55,7 @@ function start() {
 
   // Starting cube resting on the table.
   spawnGrabbableCube(
-    new Vector3(tableCenter.x, tableSurfaceY + 0.11, tableCenter.z),
+    new Vector3(tableCenter.x, tableSurfaceY + (cubeSize / 2), tableCenter.z),
     new Vector3(cubeSize, cubeSize, cubeSize),
     Quaternion.one,
     Color.red
@@ -111,6 +111,9 @@ function spawnGrabbableCube(pos: Vector3, scale: Vector3, rot: Quaternion, color
   scaleGizmo.attach(cube, {
     onScale: (s) => grabbable.setGrabBox(cube, new Vector3(s.x / 2, s.y / 2, s.z / 2)),
   });
+
+  // Spawn with physics OFF so it stays where you place it (toggle it on in the panel).
+  propertyPanel.setPhysicsEnabled(cube, false);
 
   return cube;
 }
