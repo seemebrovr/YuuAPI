@@ -74,21 +74,26 @@ function setFrozenPose(entity: Entity, pos: Vector3, rot: Quaternion): void {
 }
 
 
+type OpenOptions = {
+  /** If provided, a "Duplicate" button appears that calls this with the target. */
+  onDuplicate?: (target: Entity) => void,
+}
+
 /**
  * Open the property panel for an entity (closing any panel already open).
  * The panel floats just above the entity and faces the player.
  */
-function open(target: Entity): void {
+function open(target: Entity, options: OpenOptions = {}): void {
   close();
 
   // Float above the object, nudged toward the player. A 'Front' plane with no
   // rotation faces +Z, which is toward the player in this scene.
-  const anchor = target.pos.add(new Vector3(0, 0.3, 0.12));
+  const anchor = target.pos.add(new Vector3(0, 0.32, 0.12));
 
   panelRoot = spawnPrimitive.plane(
     'Front',
     anchor,
-    new Vector3(0.34, 0.24, 1),
+    new Vector3(0.34, 0.30, 1),
     Quaternion.one,
     new Color(0.12, 0.12, 0.14),
     1,
@@ -98,12 +103,12 @@ function open(target: Entity): void {
   );
 
   // Title.
-  addLabel(panelRoot, new Vector3(0, 0.085, 0.002), 'Properties', 5, Color.white);
+  addLabel(panelRoot, new Vector3(0, 0.11, 0.002), 'Properties', 5, Color.white);
 
   // X close button (top-right corner).
   const closeButton = makeButton(
     panelRoot,
-    new Vector3(0.14, 0.088, 0.002),
+    new Vector3(0.145, 0.115, 0.002),
     new Vector3(0.04, 0.04, 1),
     'X',
     5,
@@ -113,11 +118,11 @@ function open(target: Entity): void {
   closeButton.root.rayClick.setClickFunction(() => close());
 
   // "Physics" property row: a label on the left, a toggle button on the right.
-  addLabel(panelRoot, new Vector3(-0.085, 0, 0.002), 'Physics', 4, Color.white);
+  addLabel(panelRoot, new Vector3(-0.08, 0.02, 0.002), 'Physics', 4, Color.white);
 
   physicsButton = makeButton(
     panelRoot,
-    new Vector3(0.075, 0, 0.002),
+    new Vector3(0.08, 0.02, 0.002),
     new Vector3(0.12, 0.07, 1),
     physicsCaption(target),
     4,
@@ -128,6 +133,22 @@ function open(target: Entity): void {
     setPhysicsEnabled(target, !getPhysicsEnabled(target));
     refreshPhysicsButton(target);
   });
+
+  // Duplicate button (only shown if the caller provided a duplicate handler).
+  if (options.onDuplicate) {
+    const onDuplicate = options.onDuplicate;
+
+    const dupButton = makeButton(
+      panelRoot,
+      new Vector3(0, -0.09, 0.002),
+      new Vector3(0.22, 0.06, 1),
+      'Duplicate',
+      4,
+      new Color(0.2, 0.35, 0.6),
+      Color.white
+    );
+    dupButton.root.rayClick.setClickFunction(() => onDuplicate(target));
+  }
 }
 
 function close(): void {

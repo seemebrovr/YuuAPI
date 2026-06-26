@@ -35,18 +35,24 @@ export type GrabbableOptions = {
   onRelease?: (hand: Hand) => void,
   /**
    * Local-space points (offsets from the entity's center, in meters) the hand
-   * must be near to grab - e.g. a cube's corners, edges and face centers. They
-   * rotate and move with the entity. If omitted, the entity's center is used.
+   * must be near to grab. If omitted, grabBox or the entity's center is used.
    */
   grabPoints?: Vector3[],
+  /**
+   * Local half-extents of a box. If set, the hand can grab anywhere within
+   * grabRadius of the box's SURFACE (not just discrete points) - best for cubes
+   * and stretched boxes. Takes priority over grabPoints.
+   */
+  grabBox?: Vector3,
 }
 
 type GrabbableState = {
   entity: Entity,
   grabRadius: number,
   options: GrabbableOptions,
-  grabPoints: Vector3[],      // local-space grab anchors; empty means "use the center"
-  heldBy: Hand[],             // hands currently holding this: 0, 1, or 2
+  grabPoints: Vector3[],        // local-space grab anchors; empty means "use the center"
+  grabBox: Vector3 | undefined, // local half-extents for grabbing anywhere on the surface
+  heldBy: Hand[],               // hands currently holding this: 0, 1, or 2
   localPosOffset: Vector3,    // object position relative to the grab frame, in frame-local space
   localRotOffset: Quaternion, // object rotation relative to the grab frame
 }
@@ -67,7 +73,9 @@ export const grabbable = {
   isHeld,
   releaseAll,
   heldBy,
+  heldEntity,
   setGrabPoints,
+  setGrabBox,
 }
 
 
@@ -88,6 +96,7 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     grabRadius: grabRadius,
     options: options,
     grabPoints: options.grabPoints ?? [],
+    grabBox: options.grabBox,
     heldBy: [],
     localPosOffset: Vector3.zero,
     localRotOffset: Quaternion.one,
@@ -134,6 +143,24 @@ function setGrabPoints(entity: Entity, points: Vector3[]): void {
   if (state) {
     state.grabPoints = points;
   }
+}
+
+/**
+ * Replace the box half-extents used for surface grabbing (e.g. after a resize).
+ */
+function setGrabBox(entity: Entity, halfExtents: Vector3): void {
+  const state = grabbables.get(entity);
+
+  if (state) {
+    state.grabBox = halfExtents;
+  }
+}
+
+/**
+ * @returns the entity a given hand is currently holding, or undefined
+ */
+function heldEntity(hand: Hand): Entity | undefined {
+  return handHeld.get(hand)?.entity;
 }
 
 /**
@@ -208,31 +235,51 @@ function captureOffset(state: GrabbableState): void {
 
 
 /**
- * Shortest distance from a hand to this grabbable's grab points (world space).
- * Grab points are stored in entity-local space, so they are rotated and offset
- * by the entity's current transform. With no grab points, the distance to the
- * entity's center is used (the original behavior).
+ * Distance from a hand to where this grabbable can be grabbed.
+ *  - grabBox set:     distance to the box SURFACE (grab anywhere near any face).
+ *  - grabPoints set:  distance to the nearest discrete anchor point.
+ *  - neither:         distance to the entity's center.
+ * All shapes rotate and move with the entity.
  */
-function handDistanceToGrabPoints(state: GrabbableState, handPos: Vector3): number {
-  if (state.grabPoints.length === 0) {
-    return state.entity.pos.distanceTo(handPos);
+function handGrabDistance(state: GrabbableState, handPos: Vector3): number {
+  // Box surface distance (signed-distance-field of an axis-aligned box, in local space).
+  if (state.grabBox) {
+    const local = state.entity.rot.inverse().rotateVector(handPos.subtract(state.entity.pos));
+    const h = state.grabBox;
+
+    const qx = Math.abs(local.x) - h.x;
+    const qy = Math.abs(local.y) - h.y;
+    const qz = Math.abs(local.z) - h.z;
+
+    const ox = Math.max(qx, 0);
+    const oy = Math.max(qy, 0);
+    const oz = Math.max(qz, 0);
+
+    const outside = Math.sqrt((ox * ox) + (oy * oy) + (oz * oz));
+    const inside = Math.min(Math.max(qx, qy, qz), 0);
+
+    return Math.abs(outside + inside);
   }
 
-  const pos = state.entity.pos;
-  const rot = state.entity.rot;
+  if (state.grabPoints.length > 0) {
+    const pos = state.entity.pos;
+    const rot = state.entity.rot;
 
-  let nearest = Infinity;
+    let nearest = Infinity;
 
-  state.grabPoints.forEach((localPoint) => {
-    const worldPoint = pos.add(rot.rotateVector(localPoint));
-    const dist = worldPoint.distanceTo(handPos);
+    state.grabPoints.forEach((localPoint) => {
+      const worldPoint = pos.add(rot.rotateVector(localPoint));
+      const dist = worldPoint.distanceTo(handPos);
 
-    if (dist < nearest) {
-      nearest = dist;
-    }
-  });
+      if (dist < nearest) {
+        nearest = dist;
+      }
+    });
 
-  return nearest;
+    return nearest;
+  }
+
+  return state.entity.pos.distanceTo(handPos);
 }
 
 function tryGrab(hand: Hand): void {
@@ -256,7 +303,7 @@ function tryGrab(hand: Hand): void {
       return;
     }
 
-    const dist = handDistanceToGrabPoints(state, handPos);
+    const dist = handGrabDistance(state, handPos);
 
     if (dist <= state.grabRadius && dist < nearestDist) {
       nearest = state;
