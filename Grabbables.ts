@@ -3,6 +3,7 @@ import { Quaternion } from "./Yuu API/Basic Types/Quaternion";
 import { Vector3 } from "./Yuu API/Basic Types/Vector3";
 import { inWorldConsole } from "./Yuu API/Console";
 import { Controller } from "./Yuu API/Controller";
+import { editMode } from "./Yuu API/EditMode";
 import { Entity } from "./Yuu API/Entity";
 import { grabbable, Hand } from "./Yuu API/Grabbable";
 import { Player } from "./Yuu API/Player";
@@ -71,6 +72,10 @@ function start() {
 
   // While holding a shape, click that hand's thumbstick to open/close its panel.
   const togglePanel = (hand: Hand) => {
+    if (editMode.bothThumbsticksDown()) {
+      return; // both thumbsticks = edit-mode toggle, not a panel
+    }
+
     const held = grabbable.heldEntity(hand);
 
     if (!held) {
@@ -87,6 +92,9 @@ function start() {
 
   Controller.subscribe('leftThumbstick', 'Pressed', () => togglePanel('Left'));
   Controller.subscribe('rightThumbstick', 'Pressed', () => togglePanel('Right'));
+
+  // Toggling edit mode (both thumbsticks) closes any open property panel.
+  editMode.onModeChange(() => propertyPanel.close());
 
   // Shapes menu (left X button). Each item spawns into the hand that clicks it.
   spawnMenu.configure('Shapes', [
