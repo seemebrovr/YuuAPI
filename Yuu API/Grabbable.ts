@@ -1,3 +1,4 @@
+import { Color } from "./Basic Types/Color";
 import { Quaternion } from "./Basic Types/Quaternion";
 import { Vector3 } from "./Basic Types/Vector3";
 import { Controller } from "./Controller";
@@ -7,16 +8,13 @@ import { Player } from "./Player";
 import { registerStart } from "./RegisterStart";
 
 
-// Proximity grab with preserved offset and throw-on-release. Supports one- or
-// two-handed holding, surface grabbing, grid snapping, a per-object collidable
-// preference, and avoids launching the player:
-//   - While held, an object is "ghosted" (collision off) so it can't shove the
-//     player or jitter on the world, and follows the hand smoothly.
-//   - A non-held object near the player's body is ghosted + pinned, so you pass
-//     through it instead of being thrown.
-//   - With snapping on, a non-held object is held to a grid position with an
-//     axis-aligned rotation (so it stays put and perfectly straight).
-//   - The Collide preference (get/setCollidable) is restored after ghosting.
+// Proximity grab with preserved offset, throw-on-release, one/two-handed holding,
+// surface grabbing, grid snapping, collidable preference, a player-launch shield,
+// and a yellow proximity highlight.
+//
+// By default the GRIP grabs. In edit mode the grip is needed for flying, so the
+// project can switch grabbing to the TRIGGER: setGripEnabled(false) stops grip
+// from grabbing, and grab()/release() can be driven from the trigger instead.
 
 
 export type Hand = 'Left' | 'Right';
@@ -24,11 +22,8 @@ export type Hand = 'Left' | 'Right';
 export type GrabbableOptions = {
   onGrab?: (hand: Hand) => void,
   onRelease?: (hand: Hand) => void,
-  /** Discrete local-space anchor points to grab near (used if grabBox is unset). */
   grabPoints?: Vector3[],
-  /** Local half-extents; if set, grab anywhere within grabRadius of the box surface. */
   grabBox?: Vector3,
-  /** Grid cell size (meters) used when snapping is enabled. 0 = never snap. */
   snapGrid?: number,
 }
 
@@ -42,27 +37,35 @@ type GrabbableState = {
   grabBox: Vector3 | undefined,
   snapGrid: number,
   snapEnabled: boolean,
-  collidablePref: boolean,      // the user's chosen collidable state (restored after ghosting)
-  twoHandStartDist: number,     // hand separation when a two-handed grab began (for stretch)
-  twoHandStartScale: Vector3,   // object scale when a two-handed grab began
+  collidablePref: boolean,
+  twoHandStartDist: number,
+  twoHandStartScale: Vector3,
   heldBy: Hand[],
   localPosOffset: Vector3,
   localRotOffset: Quaternion,
-  shielded: boolean,            // currently phased out because the player body is close
+  shielded: boolean,
   shieldPose: Pose | undefined,
+  highlighted: boolean,
 }
 
 
 const grabbables = new Map<Entity, GrabbableState>();
 
-// Each hand can hold at most one grabbable.
 const handHeld = new Map<Hand, GrabbableState | undefined>([
   ['Left', undefined],
   ['Right', undefined],
 ]);
 
-// How close the player's body may get to a non-held object before it phases out.
 const playerBodyReach = 0.25;
+
+// When false, the grip no longer grabs (used in edit mode, where grip = movement
+// and grabbing is driven from the trigger via grab()/release()).
+let gripEnabled = true;
+
+// Yellow glow shown when a hand is near or inside a grabbable.
+const highlightColor = new Color(1, 0.85, 0.1);
+const highlightStrength = 1.5;
+const highlightRange = 0.07; // metres from the surface (or inside) to start glowing
 
 
 export const grabbable = {
@@ -79,6 +82,9 @@ export const grabbable = {
   setCollidable,
   getCollidable,
   forceGrab,
+  grab: tryGrab,
+  releaseHand: release,
+  setGripEnabled,
 }
 
 
@@ -88,9 +94,7 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
   }
 
   grabbables.set(entity, {
-    entity: entity,
-    grabRadius: grabRadius,
-    options: options,
+    entity, grabRadius, options,
     grabPoints: options.grabPoints ?? [],
     grabBox: options.grabBox,
     snapGrid: options.snapGrid ?? 0,
@@ -103,490 +107,252 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     localRotOffset: Quaternion.one,
     shielded: false,
     shieldPose: undefined,
+    highlighted: false,
   });
 }
 
 function remove(entity: Entity): void {
-  const state = grabbables.get(entity);
-
-  if (state) {
-    [...state.heldBy].forEach((hand) => release(hand));
-  }
-
+  const s = grabbables.get(entity);
+  if (s) { [...s.heldBy].forEach((h) => release(h)); }
   grabbables.delete(entity);
 }
 
 function isHeld(entity: Entity): boolean {
-  const state = grabbables.get(entity);
-
-  return state !== undefined && state.heldBy.length > 0;
+  const s = grabbables.get(entity);
+  return s !== undefined && s.heldBy.length > 0;
 }
 
 function heldBy(entity: Entity): Hand[] {
-  const state = grabbables.get(entity);
-
-  return state ? [...state.heldBy] : [];
+  const s = grabbables.get(entity);
+  return s ? [...s.heldBy] : [];
 }
 
-function heldEntity(hand: Hand): Entity | undefined {
-  return handHeld.get(hand)?.entity;
-}
+function heldEntity(hand: Hand): Entity | undefined { return handHeld.get(hand)?.entity; }
+function setGrabPoints(entity: Entity, points: Vector3[]): void { const s = grabbables.get(entity); if (s) { s.grabPoints = points; } }
+function setGrabBox(entity: Entity, halfExtents: Vector3): void { const s = grabbables.get(entity); if (s) { s.grabBox = halfExtents; } }
+function setSnapEnabled(entity: Entity, enabled: boolean): void { const s = grabbables.get(entity); if (s) { s.snapEnabled = enabled; } }
+function getSnapEnabled(entity: Entity): boolean { return grabbables.get(entity)?.snapEnabled ?? false; }
+function setCollidable(entity: Entity, collidable: boolean): void { const s = grabbables.get(entity); if (s) { s.collidablePref = collidable; if (s.heldBy.length === 0 && !s.shielded) { entity.collidable.set(collidable); } } }
+function getCollidable(entity: Entity): boolean { return grabbables.get(entity)?.collidablePref ?? true; }
 
-function setGrabPoints(entity: Entity, points: Vector3[]): void {
-  const state = grabbables.get(entity);
+/** Enable/disable grip grabbing. When off, grabbing is driven from grab()/release(). */
+function setGripEnabled(enabled: boolean): void { gripEnabled = enabled; }
 
-  if (state) {
-    state.grabPoints = points;
-  }
-}
+function releaseAll(): void { release('Left'); release('Right'); }
 
-function setGrabBox(entity: Entity, halfExtents: Vector3): void {
-  const state = grabbables.get(entity);
-
-  if (state) {
-    state.grabBox = halfExtents;
-  }
-}
-
-function setSnapEnabled(entity: Entity, enabled: boolean): void {
-  const state = grabbables.get(entity);
-
-  if (state) {
-    state.snapEnabled = enabled;
-  }
-}
-
-function getSnapEnabled(entity: Entity): boolean {
-  return grabbables.get(entity)?.snapEnabled ?? false;
-}
-
-function setCollidable(entity: Entity, collidable: boolean): void {
-  const state = grabbables.get(entity);
-
-  if (state) {
-    state.collidablePref = collidable;
-
-    // Apply now unless the object is currently force-ghosted (held or shielded);
-    // in those cases the preference is applied when it un-ghosts.
-    if (state.heldBy.length === 0 && !state.shielded) {
-      entity.collidable.set(collidable);
-    }
-  }
-}
-
-function getCollidable(entity: Entity): boolean {
-  return grabbables.get(entity)?.collidablePref ?? true;
-}
-
-function releaseAll(): void {
-  release('Left');
-  release('Right');
-}
-
-/**
- * Attach an entity directly to a hand (e.g. spawning an object into the hand).
- * Does nothing if that hand is already holding something.
- */
 function forceGrab(entity: Entity, hand: Hand): void {
-  const state = grabbables.get(entity);
-
-  if (!state || handHeld.get(hand) || state.heldBy.includes(hand)) {
-    return;
-  }
-
-  // Place it at the hand so it sits in the hand once held.
-  const handP = getHandPos(hand);
-
-  if (handP) {
-    entity.pos = handP;
-  }
-
-  const wasUnheld = state.heldBy.length === 0;
-
-  state.heldBy.push(hand);
-  handHeld.set(hand, state);
-
-  if (wasUnheld) {
-    if (state.shielded) {
-      state.shielded = false;
-      state.shieldPose = undefined;
-    }
-
-    entity.collidable.set(false);
-  }
-
-  captureOffset(state);
-  captureTwoHandStart(state);
-
-  state.options.onGrab?.(hand);
+  const s = grabbables.get(entity);
+  if (!s || handHeld.get(hand) || s.heldBy.includes(hand)) { return; }
+  const hp = getHandPos(hand);
+  if (hp) { entity.pos = hp; }
+  const wasUnheld = s.heldBy.length === 0;
+  s.heldBy.push(hand);
+  handHeld.set(hand, s);
+  if (wasUnheld) { if (s.shielded) { s.shielded = false; s.shieldPose = undefined; } entity.collidable.set(false); }
+  captureOffset(s);
+  captureTwoHandStart(s);
+  s.options.onGrab?.(hand);
 }
 
+function getHandPos(hand: Hand): Vector3 | undefined { return hand === 'Left' ? Player.leftHand.position.get() : Player.rightHand.position.get(); }
+function getHandRot(hand: Hand): Quaternion | undefined { return hand === 'Left' ? Player.leftHand.rotation.get() : Player.rightHand.rotation.get(); }
 
-function getHandPos(hand: Hand): Vector3 | undefined {
-  return hand === 'Left' ? Player.leftHand.position.get() : Player.rightHand.position.get();
-}
-
-function getHandRot(hand: Hand): Quaternion | undefined {
-  return hand === 'Left' ? Player.leftHand.rotation.get() : Player.rightHand.rotation.get();
-}
-
-
-function getGrabFrame(state: GrabbableState): { origin: Vector3, rot: Quaternion } | undefined {
-  if (state.heldBy.length === 1) {
-    const pos = getHandPos(state.heldBy[0]);
-    const rot = getHandRot(state.heldBy[0]);
-
-    if (!pos || !rot) {
-      return undefined;
-    }
-
-    return { origin: pos, rot: rot };
+function getGrabFrame(s: GrabbableState): { origin: Vector3, rot: Quaternion } | undefined {
+  if (s.heldBy.length === 1) {
+    const p = getHandPos(s.heldBy[0]);
+    const r = getHandRot(s.heldBy[0]);
+    if (!p || !r) { return undefined; }
+    return { origin: p, rot: r };
   }
-
-  if (state.heldBy.length >= 2) {
-    const posA = getHandPos(state.heldBy[0]);
-    const posB = getHandPos(state.heldBy[1]);
-
-    if (!posA || !posB) {
-      return undefined;
-    }
-
-    return { origin: posA.lerp(posB, 0.5), rot: Quaternion.one };
+  if (s.heldBy.length >= 2) {
+    const a = getHandPos(s.heldBy[0]);
+    const b = getHandPos(s.heldBy[1]);
+    if (!a || !b) { return undefined; }
+    return { origin: a.lerp(b, 0.5), rot: Quaternion.one };
   }
-
   return undefined;
 }
 
-function captureOffset(state: GrabbableState): void {
-  const frame = getGrabFrame(state);
-
-  if (!frame) {
-    return;
-  }
-
-  const invFrameRot = frame.rot.inverse();
-
-  state.localPosOffset = invFrameRot.rotateVector(state.entity.pos.subtract(frame.origin));
-  state.localRotOffset = invFrameRot.multiply(state.entity.rot);
+function captureOffset(s: GrabbableState): void {
+  const f = getGrabFrame(s);
+  if (!f) { return; }
+  const inv = f.rot.inverse();
+  s.localPosOffset = inv.rotateVector(s.entity.pos.subtract(f.origin));
+  s.localRotOffset = inv.multiply(s.entity.rot);
 }
 
-// Capture the hand separation and object scale when a two-handed grab begins,
-// so we can stretch the object by the change in hand distance.
-function captureTwoHandStart(state: GrabbableState): void {
-  if (state.heldBy.length !== 2) {
-    return;
-  }
-
-  const a = getHandPos(state.heldBy[0]);
-  const b = getHandPos(state.heldBy[1]);
-
-  if (a && b) {
-    state.twoHandStartDist = Math.max(a.distanceTo(b), 0.05);
-    state.twoHandStartScale = state.entity.scale;
-  }
+function captureTwoHandStart(s: GrabbableState): void {
+  if (s.heldBy.length !== 2) { return; }
+  const a = getHandPos(s.heldBy[0]);
+  const b = getHandPos(s.heldBy[1]);
+  if (a && b) { s.twoHandStartDist = Math.max(a.distanceTo(b), 0.05); s.twoHandStartScale = s.entity.scale; }
 }
 
-// While held by two hands, scale the object by how much the hands have spread
-// since the grab began (uniform stretch). Keeps the grab box in sync.
-function applyTwoHandStretch(state: GrabbableState): void {
-  if (state.heldBy.length < 2) {
-    return;
-  }
-
-  const a = getHandPos(state.heldBy[0]);
-  const b = getHandPos(state.heldBy[1]);
-
-  if (!a || !b) {
-    return;
-  }
-
-  const factor = a.distanceTo(b) / state.twoHandStartDist;
-
-  const newScale = new Vector3(
-    Math.max(state.twoHandStartScale.x * factor, 0.02),
-    Math.max(state.twoHandStartScale.y * factor, 0.02),
-    Math.max(state.twoHandStartScale.z * factor, 0.02),
-  );
-
-  state.entity.scale = newScale;
-
-  if (state.grabBox) {
-    state.grabBox = new Vector3(newScale.x / 2, newScale.y / 2, newScale.z / 2);
-  }
+function applyTwoHandStretch(s: GrabbableState): void {
+  if (s.heldBy.length < 2) { return; }
+  const a = getHandPos(s.heldBy[0]);
+  const b = getHandPos(s.heldBy[1]);
+  if (!a || !b) { return; }
+  const f = a.distanceTo(b) / s.twoHandStartDist;
+  const n = new Vector3(Math.max(s.twoHandStartScale.x * f, 0.02), Math.max(s.twoHandStartScale.y * f, 0.02), Math.max(s.twoHandStartScale.z * f, 0.02));
+  s.entity.scale = n;
+  if (s.grabBox) { s.grabBox = new Vector3(n.x / 2, n.y / 2, n.z / 2); }
 }
 
-
-// Signed distance from a world point to an axis-aligned box (in the box's local
-// frame). Negative inside, positive outside, 0 on the surface.
+// Signed distance from a point to the box surface (negative inside).
 function boxSurfaceDistance(center: Vector3, rot: Quaternion, half: Vector3, point: Vector3): number {
-  const local = rot.inverse().rotateVector(point.subtract(center));
-
-  const qx = Math.abs(local.x) - half.x;
-  const qy = Math.abs(local.y) - half.y;
-  const qz = Math.abs(local.z) - half.z;
-
-  const ox = Math.max(qx, 0);
-  const oy = Math.max(qy, 0);
-  const oz = Math.max(qz, 0);
-
-  const outside = Math.sqrt((ox * ox) + (oy * oy) + (oz * oz));
-  const inside = Math.min(Math.max(qx, qy, qz), 0);
-
-  return outside + inside;
+  const l = rot.inverse().rotateVector(point.subtract(center));
+  const qx = Math.abs(l.x) - half.x;
+  const qy = Math.abs(l.y) - half.y;
+  const qz = Math.abs(l.z) - half.z;
+  const ox = Math.max(qx, 0), oy = Math.max(qy, 0), oz = Math.max(qz, 0);
+  return Math.sqrt((ox * ox) + (oy * oy) + (oz * oz)) + Math.min(Math.max(qx, qy, qz), 0);
 }
 
-function halfExtentsOf(state: GrabbableState): Vector3 {
-  if (state.grabBox) {
-    return state.grabBox;
-  }
-
-  const s = state.entity.scale;
-
-  return new Vector3(s.x / 2, s.y / 2, s.z / 2);
+function halfExtentsOf(s: GrabbableState): Vector3 {
+  if (s.grabBox) { return s.grabBox; }
+  const sc = s.entity.scale;
+  return new Vector3(sc.x / 2, sc.y / 2, sc.z / 2);
 }
 
-function handGrabDistance(state: GrabbableState, handPos: Vector3): number {
-  if (state.grabBox) {
-    return Math.abs(boxSurfaceDistance(state.entity.pos, state.entity.rot, state.grabBox, handPos));
+function handGrabDistance(s: GrabbableState, hp: Vector3): number {
+  if (s.grabBox) { return Math.abs(boxSurfaceDistance(s.entity.pos, s.entity.rot, s.grabBox, hp)); }
+  if (s.grabPoints.length > 0) {
+    const pos = s.entity.pos;
+    const rot = s.entity.rot;
+    let n = Infinity;
+    s.grabPoints.forEach((lp) => { const d = pos.add(rot.rotateVector(lp)).distanceTo(hp); if (d < n) { n = d; } });
+    return n;
   }
-
-  if (state.grabPoints.length > 0) {
-    const pos = state.entity.pos;
-    const rot = state.entity.rot;
-
-    let nearest = Infinity;
-
-    state.grabPoints.forEach((localPoint) => {
-      const worldPoint = pos.add(rot.rotateVector(localPoint));
-      const dist = worldPoint.distanceTo(handPos);
-
-      if (dist < nearest) {
-        nearest = dist;
-      }
-    });
-
-    return nearest;
-  }
-
-  return state.entity.pos.distanceTo(handPos);
+  return s.entity.pos.distanceTo(hp);
 }
 
-
-// Axis-aligned (multiples of 90 degrees) candidate orientations, built once.
-let snapOrientationsCache: Quaternion[] | undefined;
-
-function snapOrientations(): Quaternion[] {
-  if (!snapOrientationsCache) {
-    const angles = [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2];
-    const list: Quaternion[] = [];
-
-    angles.forEach((x) => {
-      angles.forEach((y) => {
-        angles.forEach((z) => {
-          list.push(Quaternion.fromEuler(new Vector3(x, y, z)));
-        });
-      });
-    });
-
-    snapOrientationsCache = list;
-  }
-
-  return snapOrientationsCache;
+// Signed (negative inside) for the highlight, so reaching INTO an object glows too.
+function handHighlightDistance(s: GrabbableState, hp: Vector3): number {
+  if (s.grabBox) { return boxSurfaceDistance(s.entity.pos, s.entity.rot, s.grabBox, hp); }
+  return handGrabDistance(s, hp);
 }
 
-// Snap a rotation to the nearest axis-aligned (90-degree) orientation, keeping
-// which way the object is turned (so a box placed along Z stays along Z).
-function snapRotation(q: Quaternion): Quaternion {
-  const candidates = snapOrientations();
+function updateHighlight(s: GrabbableState): void {
+  const lh = getHandPos('Left');
+  const rh = getHandPos('Right');
 
-  let best = candidates[0];
-  let bestDot = -1;
+  let near = false;
+  if (lh && handHighlightDistance(s, lh) < highlightRange) { near = true; }
+  if (!near && rh && handHighlightDistance(s, rh) < highlightRange) { near = true; }
 
-  candidates.forEach((c) => {
-    // |dot| because q and -q are the same rotation; nearest = largest |dot|.
-    const dot = Math.abs((q.x * c.x) + (q.y * c.y) + (q.z * c.z) + (q.w * c.w));
-
-    if (dot > bestDot) {
-      bestDot = dot;
-      best = c;
+  if (near !== s.highlighted) {
+    s.highlighted = near;
+    if (near) {
+      s.entity.mesh.material.emissionColor.set(highlightColor);
+      s.entity.mesh.material.emissionStrength.set(highlightStrength);
     }
-  });
-
-  return best.clone();
+    else {
+      s.entity.mesh.material.emissionColor.set(Color.black); // black disables emission
+    }
+  }
 }
-
 
 function tryGrab(hand: Hand): void {
-  if (handHeld.get(hand)) {
-    return;
-  }
-
-  const handPos = getHandPos(hand);
-
-  if (!handPos) {
-    return;
-  }
-
+  if (handHeld.get(hand)) { return; }
+  const hp = getHandPos(hand);
+  if (!hp) { return; }
   let nearest: GrabbableState | undefined;
-  let nearestDist = Infinity;
-
-  grabbables.forEach((state) => {
-    if (state.heldBy.includes(hand) || !state.entity.exists()) {
-      return;
-    }
-
-    const dist = handGrabDistance(state, handPos);
-
-    if (dist <= state.grabRadius && dist < nearestDist) {
-      nearest = state;
-      nearestDist = dist;
-    }
+  let nd = Infinity;
+  grabbables.forEach((s) => {
+    if (s.heldBy.includes(hand) || !s.entity.exists()) { return; }
+    const d = handGrabDistance(s, hp);
+    if (d <= s.grabRadius && d < nd) { nearest = s; nd = d; }
   });
-
-  if (!nearest) {
-    return;
-  }
-
+  if (!nearest) { return; }
   const wasUnheld = nearest.heldBy.length === 0;
-
   nearest.heldBy.push(hand);
   handHeld.set(hand, nearest);
-
-  // Ghost the object while held so it can't shove the player or snag on the world.
-  if (wasUnheld) {
-    if (nearest.shielded) {
-      nearest.shielded = false;
-      nearest.shieldPose = undefined;
-    }
-
-    nearest.entity.collidable.set(false);
-  }
-
+  if (wasUnheld) { if (nearest.shielded) { nearest.shielded = false; nearest.shieldPose = undefined; } nearest.entity.collidable.set(false); }
   captureOffset(nearest);
   captureTwoHandStart(nearest);
-
   nearest.options.onGrab?.(hand);
 }
 
 function release(hand: Hand): void {
-  const state = handHeld.get(hand);
-
-  if (!state) {
-    return;
-  }
-
-  state.heldBy = state.heldBy.filter((h) => h !== hand);
+  const s = handHeld.get(hand);
+  if (!s) { return; }
+  s.heldBy = s.heldBy.filter((h) => h !== hand);
   handHeld.set(hand, undefined);
-
-  if (state.heldBy.length > 0) {
-    // Still held by the other hand: re-capture so control passes smoothly.
-    captureOffset(state);
-  }
-  else {
-    // Fully released: restore the user's collidable preference. (Grid snapping,
-    // if on, is applied continuously in onPhysicsUpdate.)
-    state.entity.collidable.set(state.collidablePref);
-  }
-
-  state.options.onRelease?.(hand);
+  if (s.heldBy.length > 0) { captureOffset(s); } else { s.entity.collidable.set(s.collidablePref); }
+  s.options.onRelease?.(hand);
 }
-
 
 registerStart(start);
 function start() {
   Events.onPhysicsUpdate(onPhysicsUpdate);
-
-  Controller.subscribe('leftGrip', 'Pressed', () => tryGrab('Left'));
-  Controller.subscribe('leftGrip', 'Released', () => release('Left'));
-  Controller.subscribe('rightGrip', 'Pressed', () => tryGrab('Right'));
-  Controller.subscribe('rightGrip', 'Released', () => release('Right'));
+  Controller.subscribe('leftGrip', 'Pressed', () => { if (gripEnabled) { tryGrab('Left'); } });
+  Controller.subscribe('leftGrip', 'Released', () => { if (gripEnabled) { release('Left'); } });
+  Controller.subscribe('rightGrip', 'Pressed', () => { if (gripEnabled) { tryGrab('Right'); } });
+  Controller.subscribe('rightGrip', 'Released', () => { if (gripEnabled) { release('Right'); } });
 }
 
 function onPhysicsUpdate(deltaTime: number) {
-  if (deltaTime <= 0) {
-    return;
-  }
-
+  if (deltaTime <= 0) { return; }
   const bodyPos = Player.body.position.get();
 
-  grabbables.forEach((state) => {
-    if (!state.entity.exists()) {
-      if (state.heldBy.length > 0) {
-        state.heldBy.forEach((hand) => handHeld.set(hand, undefined));
-        state.heldBy = [];
-      }
+  grabbables.forEach((s) => {
+    if (!s.entity.exists()) {
+      if (s.heldBy.length > 0) { s.heldBy.forEach((h) => handHeld.set(h, undefined)); s.heldBy = []; }
       return;
     }
 
-    // Held: drive the object to follow the grab frame (it is ghosted already).
-    if (state.heldBy.length > 0) {
-      const frame = getGrabFrame(state);
+    updateHighlight(s);
 
-      if (!frame) {
-        return;
-      }
-
-      const targetPos = frame.origin.add(frame.rot.rotateVector(state.localPosOffset));
-      const targetRot = frame.rot.multiply(state.localRotOffset);
-
-      const requiredVel = targetPos.subtract(state.entity.pos).divide(deltaTime);
-      state.entity.velocity.set(requiredVel);
-      state.entity.rot = targetRot;
-
-      applyTwoHandStretch(state);
+    if (s.heldBy.length > 0) {
+      const f = getGrabFrame(s);
+      if (!f) { return; }
+      const tp = f.origin.add(f.rot.rotateVector(s.localPosOffset));
+      const tr = f.rot.multiply(s.localRotOffset);
+      s.entity.velocity.set(tp.subtract(s.entity.pos).divide(deltaTime));
+      s.entity.rot = tr;
+      applyTwoHandStretch(s);
       return;
     }
 
-    // Not held: shield the player from being launched by this object.
-    const shielded = bodyPos ? applyPlayerShield(state, bodyPos) : false;
+    const shielded = bodyPos ? applyPlayerShield(s, bodyPos) : false;
 
-    // Snapping on: hold a grid position and an axis-aligned rotation every frame
-    // so it stays put and perfectly straight (no physics tipping).
-    if (!shielded && state.snapEnabled && state.snapGrid > 0) {
-      const g = state.snapGrid;
-      const p = state.entity.pos;
-
-      state.entity.pos = new Vector3(
-        Math.round(p.x / g) * g,
-        Math.round(p.y / g) * g,
-        Math.round(p.z / g) * g,
-      );
-      state.entity.rot = snapRotation(state.entity.rot);
-      state.entity.velocity.set(Vector3.zero);
+    if (!shielded && s.snapEnabled && s.snapGrid > 0) {
+      const g = s.snapGrid;
+      const p = s.entity.pos;
+      s.entity.pos = new Vector3(Math.round(p.x / g) * g, Math.round(p.y / g) * g, Math.round(p.z / g) * g);
+      s.entity.rot = snapRotation(s.entity.rot);
+      s.entity.velocity.set(Vector3.zero);
     }
   });
 }
 
-// Returns true if the object is currently shielded (phased out near the player).
-function applyPlayerShield(state: GrabbableState, bodyPos: Vector3): boolean {
-  // If the user already made it non-collidable, there's nothing to shield.
-  if (!state.collidablePref) {
-    return false;
+let snapCache: Quaternion[] | undefined;
+function snapOrientations(): Quaternion[] {
+  if (!snapCache) {
+    const a = [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2];
+    const list: Quaternion[] = [];
+    a.forEach((x) => { a.forEach((y) => { a.forEach((z) => { list.push(Quaternion.fromEuler(new Vector3(x, y, z))); }); }); });
+    snapCache = list;
   }
+  return snapCache;
+}
+function snapRotation(q: Quaternion): Quaternion {
+  const c = snapOrientations();
+  let best = c[0];
+  let bd = -1;
+  c.forEach((x) => { const d = Math.abs((q.x * x.x) + (q.y * x.y) + (q.z * x.z) + (q.w * x.w)); if (d > bd) { bd = d; best = x; } });
+  return best.clone();
+}
 
-  const surfaceDist = boxSurfaceDistance(state.entity.pos, state.entity.rot, halfExtentsOf(state), bodyPos);
-
-  if (surfaceDist < playerBodyReach) {
-    if (!state.shielded) {
-      state.shielded = true;
-      state.shieldPose = { pos: state.entity.pos.clone(), rot: state.entity.rot.clone() };
-      state.entity.collidable.set(false);
-    }
-
-    if (state.shieldPose) {
-      state.entity.pos = state.shieldPose.pos;
-      state.entity.rot = state.shieldPose.rot;
-      state.entity.velocity.set(Vector3.zero);
-    }
-
+function applyPlayerShield(s: GrabbableState, bodyPos: Vector3): boolean {
+  if (!s.collidablePref) { return false; }
+  const sd = boxSurfaceDistance(s.entity.pos, s.entity.rot, halfExtentsOf(s), bodyPos);
+  if (sd < playerBodyReach) {
+    if (!s.shielded) { s.shielded = true; s.shieldPose = { pos: s.entity.pos.clone(), rot: s.entity.rot.clone() }; s.entity.collidable.set(false); }
+    if (s.shieldPose) { s.entity.pos = s.shieldPose.pos; s.entity.rot = s.shieldPose.rot; s.entity.velocity.set(Vector3.zero); }
     return true;
   }
-
-  if (state.shielded) {
-    state.shielded = false;
-    state.shieldPose = undefined;
-    state.entity.collidable.set(state.collidablePref);
-  }
-
+  if (s.shielded) { s.shielded = false; s.shieldPose = undefined; s.entity.collidable.set(s.collidablePref); }
   return false;
 }
