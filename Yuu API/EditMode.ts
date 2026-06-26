@@ -1,3 +1,4 @@
+import { Quaternion } from "./Basic Types/Quaternion";
 import { Vector3 } from "./Basic Types/Vector3";
 import { Controller } from "./Controller";
 import { Events } from "./Events";
@@ -9,46 +10,55 @@ import { registerStart } from "./RegisterStart";
 // ============================================================================
 // EditMode - a free-fly build mode.
 // ----------------------------------------------------------------------------
-//  - Toggle by clicking BOTH thumbsticks in at the same time.
-//  - While active you float (the rig position is driven directly, so gravity is
-//    overridden and your body passes through everything).
-//  - Move by gripping EMPTY space and pulling: your rig slides opposite to your
-//    hand, like climbing through the world. Two hands move you more smoothly.
-//  - Gripping NEAR an object still grabs it (the grab system handles that), so a
-//    hand that's holding something doesn't move you - you can carry a piece and
-//    fly with the other hand.
+//  - Toggle by clicking BOTH thumbsticks in at once.
+//  - One grip in empty space: PULL yourself through the world.
+//  - Both grips in empty space: pull (move), TWIST your hands to turn (yaw),
+//    and SPREAD/CLOSE your hands to zoom in/out (dolly toward/away your view).
+//  - Gripping while HOLDING an object never moves you - so grabbing or stretching
+//    an object can't fling the camera. (You fly with empty hands.)
+//
+// All movement is measured against the rig's ACTUAL transform each frame (closed
+// loop) and clamped, so nothing can run away.
 // ============================================================================
 
 
 type HandFlags = { Left: boolean, Right: boolean };
-type HandVecs = { Left: Vector3, Right: Vector3 };
 
 const hands: Hand[] = ['Left', 'Right'];
+
+const dollyGain = 2.5;       // meters moved per meter of hand-spread change (zoom strength)
+const maxStep = 0.3;         // ignore implausible per-frame position jumps (m)
+const maxTwist = 1.0;        // ignore implausible per-frame twists (radians)
 
 
 let active = false;
 
-// The rig position we drive toward while in edit mode (our target).
+// The rig transform we drive toward while in edit mode.
 let flyPos = Vector3.zero;
+let flyRot = Quaternion.one;
 
-// Button down-states.
+// Button down-states + toggle debounce.
 const gripDown: HandFlags = { Left: false, Right: false };
 const thumbDown: HandFlags = { Left: false, Right: false };
-let bothThumbsActive = false; // debounce so both-thumbsticks toggles once per press
+let bothThumbsActive = false;
 
-// Per-hand locomotion tracking.
-const wasWorldGripping: HandFlags = { Left: false, Right: false };
-const lastHandLocal: HandVecs = { Left: Vector3.zero, Right: Vector3.zero };
+// One-hand locomotion tracking.
+let wasOneHand = false;
+let oneHandWhich: Hand | undefined = undefined;
+let lastOneLocal = Vector3.zero;
+
+// Two-hand locomotion tracking.
+let wasTwoHand = false;
+let lastTwoAvg = Vector3.zero;
+let lastTwoBearing = 0;
+let lastTwoDist = 0;
 
 const modeChangeCallbacks: ((isActive: boolean) => void)[] = [];
 
 
 export const editMode = {
-  /** Whether edit mode is currently on. */
   isActive: (): boolean => active,
-  /** True while both thumbsticks are held (so other systems can ignore that press). */
   bothThumbsticksDown: (): boolean => thumbDown.Left && thumbDown.Right,
-  /** Register a callback fired whenever edit mode turns on or off. */
   onModeChange: (callback: (isActive: boolean) => void): void => { modeChangeCallbacks.push(callback); },
 }
 
@@ -62,12 +72,15 @@ function setActive(value: boolean): void {
 
   if (active) {
     const p = Player.position.get();
+    const r = Player.rotation.get();
+
     flyPos = p ? p.clone() : Vector3.zero;
+    flyRot = r ? r.clone() : Quaternion.one;
 
-    wasWorldGripping.Left = false;
-    wasWorldGripping.Right = false;
+    wasOneHand = false;
+    wasTwoHand = false;
 
-    console.log('Edit mode: ON - grip empty space to fly');
+    console.log('Edit mode: ON - one grip to move, two grips to move/turn/zoom');
   }
   else {
     console.log('Edit mode: OFF');
@@ -79,6 +92,10 @@ function setActive(value: boolean): void {
 
 function handPos(hand: Hand): Vector3 | undefined {
   return hand === 'Left' ? Player.leftHand.position.get() : Player.rightHand.position.get();
+}
+
+function yawQuaternion(angle: number): Quaternion {
+  return Quaternion.fromEuler(new Vector3(0, angle, 0));
 }
 
 
@@ -120,55 +137,120 @@ function onPhysicsUpdate(deltaTime: number): void {
     return;
   }
 
-  // Measure the hand against the rig's ACTUAL position (read fresh each frame),
-  // not against our target. This closes the feedback loop, so the movement can't
-  // run away even if the engine resists Player.position.set.
   const rigPos = Player.position.get();
+  const rigRot = Player.rotation.get();
 
-  if (!rigPos) {
+  if (!rigPos || !rigRot) {
     return;
   }
 
-  let move = Vector3.zero;
-  let count = 0;
+  // The fix: while a hand is holding an object, gripping does NOT move you, so
+  // grabbing or two-hand stretching an object can't fling the camera.
+  const holdingObject = grabbable.heldEntity('Left') !== undefined || grabbable.heldEntity('Right') !== undefined;
 
-  hands.forEach((hand) => {
-    // A hand moves you only when it grips empty space (not holding an object).
-    const worldGripping = gripDown[hand] && grabbable.heldEntity(hand) === undefined;
+  const gripping = holdingObject ? [] : hands.filter((hand) => gripDown[hand]);
 
-    if (!worldGripping) {
-      wasWorldGripping[hand] = false;
-      return;
-    }
-
-    const handWorld = handPos(hand);
-
-    if (!handWorld) {
-      wasWorldGripping[hand] = false;
-      return;
-    }
-
-    // Physical hand offset from the actual rig.
-    const offset = handWorld.subtract(rigPos);
-
-    if (wasWorldGripping[hand]) {
-      const delta = offset.subtract(lastHandLocal[hand]);
-
-      // Safety: ignore impossible single-frame jumps so nothing can fling you.
-      if (delta.magnitude() < 0.3) {
-        move = move.subtract(delta); // move opposite the hand's motion
-        count++;
-      }
-    }
-
-    lastHandLocal[hand] = offset;
-    wasWorldGripping[hand] = true;
-  });
-
-  if (count > 0) {
-    flyPos = flyPos.add(move.divide(count)); // average when both hands are pulling
+  if (gripping.length >= 2) {
+    twoHandMove(rigPos, rigRot);
+    wasOneHand = false;
+  }
+  else if (gripping.length === 1) {
+    oneHandMove(gripping[0], rigPos, rigRot);
+    wasTwoHand = false;
+  }
+  else {
+    wasOneHand = false;
+    wasTwoHand = false;
   }
 
-  // Drive the rig toward our target (holds you floating + applies movement).
+  // Drive the rig toward our target (holds you floating + applies movement/turn).
   Player.position.set(flyPos);
+  Player.rotation.set(flyRot);
+}
+
+
+function oneHandMove(hand: Hand, rigPos: Vector3, rigRot: Quaternion): void {
+  const hw = handPos(hand);
+
+  if (!hw) {
+    wasOneHand = false;
+    return;
+  }
+
+  // Hand position in the rig's local frame (physical, independent of where/how
+  // the rig is placed) so it can't feed back into itself.
+  const local = rigRot.inverse().rotateVector(hw.subtract(rigPos));
+
+  if (wasOneHand && oneHandWhich === hand) {
+    const delta = local.subtract(lastOneLocal);
+
+    if (delta.magnitude() < maxStep) {
+      flyPos = flyPos.subtract(rigRot.rotateVector(delta)); // move opposite the hand
+    }
+  }
+
+  lastOneLocal = local;
+  oneHandWhich = hand;
+  wasOneHand = true;
+}
+
+
+function twoHandMove(rigPos: Vector3, rigRot: Quaternion): void {
+  const hl = handPos('Left');
+  const hr = handPos('Right');
+
+  if (!hl || !hr) {
+    wasTwoHand = false;
+    return;
+  }
+
+  const invRot = rigRot.inverse();
+  const localL = invRot.rotateVector(hl.subtract(rigPos));
+  const localR = invRot.rotateVector(hr.subtract(rigPos));
+
+  const avg = localL.add(localR).multiply(0.5);
+  const between = localR.subtract(localL);
+  const bearing = Math.atan2(between.x, between.z);
+  const dist = between.magnitude();
+
+  if (wasTwoHand) {
+    // --- Translate: move opposite the midpoint's motion ---
+    const avgDelta = avg.subtract(lastTwoAvg);
+
+    if (avgDelta.magnitude() < maxStep) {
+      flyPos = flyPos.subtract(rigRot.rotateVector(avgDelta));
+    }
+
+    // --- Rotate (yaw): twist of the two hands turns you, pivoting on your head ---
+    let twist = bearing - lastTwoBearing;
+    while (twist > Math.PI) { twist -= 2 * Math.PI; }
+    while (twist < -Math.PI) { twist += 2 * Math.PI; }
+
+    if (Math.abs(twist) < maxTwist) {
+      const yaw = yawQuaternion(-twist);
+      const head = Player.head.position.get();
+
+      if (head) {
+        flyPos = head.add(yaw.rotateVector(flyPos.subtract(head))); // pivot on the head
+      }
+
+      flyRot = yaw.multiply(flyRot);
+    }
+
+    // --- Zoom (dolly): spread/close the hands to move along your view ---
+    const distDelta = dist - lastTwoDist;
+
+    if (Math.abs(distDelta) < maxStep) {
+      const forward = Player.forward.get();
+
+      if (forward) {
+        flyPos = flyPos.add(forward.multiply(distDelta * dollyGain)); // spread = forward (zoom in)
+      }
+    }
+  }
+
+  lastTwoAvg = avg;
+  lastTwoBearing = bearing;
+  lastTwoDist = dist;
+  wasTwoHand = true;
 }
