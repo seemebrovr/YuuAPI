@@ -498,24 +498,28 @@ function flushPoseInNeighbor(s: GrabbableState, gbA: Vector3, o: GrabbableState)
   const heAL = absVec(rel90.rotateVector(gbA));                      // A half-extents in B-local axes
   const localCA = rotB.inverse().rotateVector(s.entity.pos.subtract(cB)); // A centre in B-local
 
-  // Contact axis = axis of greatest separation in B-local (B's centre is the origin).
-  let k = 0;
-  if (Math.abs(localCA.y) > Math.abs(axisGet(localCA, k))) { k = 1; }
-  if (Math.abs(localCA.z) > Math.abs(axisGet(localCA, k))) { k = 2; }
-
-  const out = [localCA.x, localCA.y, localCA.z];
-  for (let j = 0; j < 3; j++) {
-    if (j === k) {
-      const sign = axisGet(localCA, j) >= 0 ? 1 : -1;
-      out[j] = sign * (axisGet(gbB, j) + axisGet(heAL, j)); // flush faces
-    } else {
+  // Try contact on EACH axis and keep the face needing the least movement. A single
+  // "largest centre separation" axis mis-picks for stretched / elongated pieces
+  // (their centre sits far along the long axis), which is what left a gap after the
+  // X/Y/Z handles changed a piece's size. Nearest-face is correct for any aspect ratio.
+  let bestLocal = new Vector3(localCA.x, localCA.y, localCA.z);
+  let bestDisp = Infinity;
+  for (let k = 0; k < 3; k++) {
+    const out = [localCA.x, localCA.y, localCA.z];
+    const sign = axisGet(localCA, k) >= 0 ? 1 : -1;
+    out[k] = sign * (axisGet(gbB, k) + axisGet(heAL, k)); // flush faces on the contact axis
+    for (let j = 0; j < 3; j++) {
+      if (j === k) { continue; }
       const lo = -axisGet(gbB, j) + axisGet(heAL, j); // low edges aligned
       const hi = axisGet(gbB, j) - axisGet(heAL, j);  // high edges aligned
       out[j] = nearestOf(axisGet(localCA, j), [lo, 0, hi]); // 0 = centred
     }
+    const cand = new Vector3(out[0], out[1], out[2]);
+    const disp = cand.subtract(localCA).magnitude();
+    if (disp < bestDisp) { bestDisp = disp; bestLocal = cand; }
   }
 
-  const worldPos = cB.add(rotB.rotateVector(new Vector3(out[0], out[1], out[2])));
+  const worldPos = cB.add(rotB.rotateVector(bestLocal));
   return { pos: worldPos, rot: worldRot };
 }
 
